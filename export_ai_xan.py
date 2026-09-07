@@ -167,6 +167,7 @@ _OUT_ERRPATH = ""
 _STOP_EVT = threading.Event()          # 置位 => 用户取消(限速等待中的请求尽快中止)
 _UIQ = None                            # GUI 事件队列；None = 纯命令行模式
 _hist_flush = [0]                      # 距上次落盘的下载数(每 25 个落盘一次)
+_TOTAL_JOBS = 0                        # 本批待导出会话总数(worker 进度事件用)
 _counter_lock = threading.Lock()
 fmt_lock = threading.Lock()
 
@@ -479,7 +480,7 @@ def worker(api, job, out_dir, include_json, overwrite, results, lock):
     finally:
         with _counter_lock:
             done = _counter["convs"] + _counter["skipped"] + _counter["errors"]
-        ui_event(t="convs", done=done)
+        ui_event(t="convs", done=done, total=_TOTAL_JOBS)
 def _finalize(me, apps, results, cancelled):
     """收尾: 合并各应用总 txt + 写 index.json + 存历史 + 汇总日志(正常/取消共用)。"""
     out_dir = _OUT
@@ -574,7 +575,8 @@ def run_export(args, is_gui=False):
         for k in _counter:
             _counter[k] = 0
 
-    global _OUT, _H, _OUT_LOGPATH, _OUT_ERRPATH
+    global _OUT, _H, _OUT_LOGPATH, _OUT_ERRPATH, _TOTAL_JOBS
+    _TOTAL_JOBS = 0
 
     # ---- 0. 选择域名(镜像): auto=自动ping选延迟最低; 否则用指定/自定义域名 ----
     domain = getattr(args, "domain", "").strip()
@@ -722,6 +724,7 @@ def run_export(args, is_gui=False):
                 log(f"预计需网络下载约 {to_dl}/{len(jobs)} 个会话(其余自动跳过), "
                     f"限速等待约 {to_dl * avg_wait / 60:.0f} 分钟")
             log(f"待导出会话总数: {len(jobs)}")
+            _TOTAL_JOBS = len(jobs)
             ui_event(t="convs", done=0, total=len(jobs))
             ui_event(t="phase", text=f"导出会话 0/{len(jobs)}…")
             from concurrent.futures import ThreadPoolExecutor, CancelledError as _CF_Cancelled
@@ -1073,47 +1076,56 @@ class ExportGui:
         messagebox.showerror("出错", msg, parent=self.root)
 
     # ---------- 事件泵: 工作线程只往队列塞, 只在主线程动控件 ----------
+    def _handle(self, ev):
+        """处理单个 GUI 事件(仅主线程调用)。"""
+        t = ev.get("t")
+        if t == "log":
+            self._log_append(ev["line"])
+        elif t == "logerr":
+            self._log_append(ev["line"], "err")
+        elif t == "phase":
+            self.var_status.set(ev["text"])
+            self.var_wait.set("")
+        elif t == "busy":
+            self.bar.stop()
+            self.bar.config(mode="indeterminate")
+            self.bar.start(12)
+            if ev.get("text"):
+                self.var_status.set(ev["text"])
+        elif t == "apps":
+            total = max(1, int(ev["total"]))
+            self.bar.stop()
+            self.bar.config(mode="determinate", maximum=total, value=int(ev["done"]))
+            self.var_status.set(f"扫描会话列表 {ev['done']}/{ev['total']} …")
+            self.var_wait.set("")
+        elif t == "convs":
+            if ev.get("total"):
+                self._total = int(ev["total"])
+            total = self._total or 0
+            self.bar.stop()
+            self.bar.config(mode="determinate", maximum=max(1, total), value=int(ev["done"]))
+            self.var_status.set(f"导出会话 {ev['done']}/{max(1, total)}(已下载的自动跳过)")
+            self.var_wait.set("")
+        elif t == "wait":
+            self.var_wait.set(f"防封号限速: 下一请求还需等待约 {int(ev['sec']) + 1}s")
+        elif t == "ping_done":
+            self.v_domain.set(ev["url"])
+            self._log_append(f"已选最快域名: {ev['url']} ({ev['ms']}ms)")
+            self.var_status.set(f"已选最快域名: {ev['url']} ({ev['ms']}ms), 可点「开始导出」")
+        elif t == "done":
+            self._on_done(ev.get("summary") or {})
+        elif t == "fatal":
+            self._on_fatal(ev.get("msg", "未知错误"))
+
     def _pump(self):
+        """事件泵: 工作线程只往队列塞, 只在主线程动控件; 单个事件出错不会杀死泵。"""
         try:
             while True:
                 ev = self.q.get_nowait()
-                t = ev.get("t")
-                if t == "log":
-                    self._log_append(ev["line"])
-                elif t == "logerr":
-                    self._log_append(ev["line"], "err")
-                elif t == "phase":
-                    self.var_status.set(ev["text"])
-                    self.var_wait.set("")
-                elif t == "busy":
-                    self.bar.stop()
-                    self.bar.config(mode="indeterminate")
-                    self.bar.start(12)
-                    if ev.get("text"):
-                        self.var_status.set(ev["text"])
-                elif t == "apps":
-                    total = max(1, int(ev["total"]))
-                    self.bar.stop()
-                    self.bar.config(mode="determinate", maximum=total, value=int(ev["done"]))
-                    self.var_status.set(f"扫描会话列表 {ev['done']}/{ev['total']} …")
-                    self.var_wait.set("")
-                elif t == "convs":
-                    total = int(ev["total"])
-                    self._total = total
-                    self.bar.stop()
-                    self.bar.config(mode="determinate", maximum=max(1, total), value=int(ev["done"]))
-                    self.var_status.set(f"导出会话 {ev['done']}/{total}(已下载的自动跳过)")
-                    self.var_wait.set("")
-                elif t == "wait":
-                    self.var_wait.set(f"防封号限速: 下一请求还需等待约 {int(ev['sec']) + 1}s")
-                elif t == "ping_done":
-                    self.v_domain.set(ev["url"])
-                    self._log_append(f"已选最快域名: {ev['url']} ({ev['ms']}ms)")
-                    self.var_status.set(f"已选最快域名: {ev['url']} ({ev['ms']}ms), 可点「开始导出」")
-                elif t == "done":
-                    self._on_done(ev.get("summary") or {})
-                elif t == "fatal":
-                    self._on_fatal(ev.get("msg", "未知错误"))
+                try:
+                    self._handle(ev)
+                except Exception as e:
+                    self._log_append(f"[界面] 事件处理失败: {e!r}", "err")
         except queue.Empty:
             pass
         self.root.after(80, self._pump)
